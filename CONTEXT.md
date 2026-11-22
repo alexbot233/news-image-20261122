@@ -36,3 +36,7 @@ Honor OUT_DIR env (default /output); write the PNG to $OUT_DIR/main.png. Determi
 - Constraints: <=1 MiB, <=1024x1024, valid whole PNG, byte-identical across two runs (compute sha256 twice), no network, no randomness/timestamps.
 - Verify locally with OUT_DIR=out python3 main.py, then inspect the render at full size; fix defects via FIXES.md (one defect per line) and iterate until the sweep is clean.
 - README.md must carry the competition's three live make.fun badge links for slug news-image-20261122 with owner/repo alexbot233/news-image-20261122.
+
+## SCORER REQUIREMENT (critical)
+- The harness scorer checks that the program writes /output/entry.png. The output file MUST be named entry.png (honor OUT_DIR env, default /output).
+- Do NOT read git history or any backup of a previous main.py; write main.py from scratch based on this CONTEXT.md only.

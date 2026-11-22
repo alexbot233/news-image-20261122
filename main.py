@@ -1,651 +1,541 @@
 #!/usr/bin/env python3
-"""Deterministic, stdlib-only front page for 22 November 2026.
+"""Front page of 22 November 2026 -- deterministic, standard-library PNG renderer.
 
-Renders one PNG (1024x1024) to $OUT_DIR/main.png (default /output).
-No network, no randomness, no timestamps: two runs are byte-identical.
+The page is drawn directly into an RGB pixel buffer; a small hand-rolled PNG
+encoder writes the result.  No randomness, clocks, network calls or external
+packages are used, so repeated runs are byte-identical.
 """
-
-from __future__ import annotations
 
 import math
 import os
 import re
 import struct
 import zlib
-from pathlib import Path
 
 # ---------------------------------------------------------------------------
 # Canvas constants
 # ---------------------------------------------------------------------------
 
-W = 1024
-H = 1024
-DATE_TEXT = "22 NOVEMBER 2026"
+WIDTH = 1024
+HEIGHT = 1024
 
-PAPER = (244, 241, 232)
-INK = (16, 20, 26)
-SUBINK = (74, 81, 90)
-BORDER = (198, 194, 183)
-ICON_BG = (232, 229, 220)
-ICON_LIGHT = (212, 218, 226)
-WATER = (126, 142, 154)
-RED = (166, 42, 33)
-GOLD = (214, 163, 55)
+PAPER = (246, 242, 232)
+PANEL = (255, 254, 249)
+INK = (22, 27, 33)
+MUTED = (96, 101, 106)
+RULE = (198, 192, 177)
+DARK = (19, 24, 30)
+WHITE = (255, 255, 255)
+GOLD = (226, 176, 62)
+FIRE = (213, 79, 36)
+DATE = "22 NOVEMBER 2026"
 
-GRID_X = 14
-GRID_Y = 158
-CARD_W = 492
-CARD_H = 194
-GUTTER_X = 12
-GUTTER_Y = 6
+MARGIN = 24
+COL_W = 480
+COL_X = (24, 520)
+ROW_Y = (170, 364, 558, 752)
+CARD_H = 182
+ROW_GAP = 12
 
-ICON_W = 112
-ICON_H = 150
-TEXT_X = 128
-TEXT_W = CARD_W - TEXT_X - 8  # 356 px
-
-TICKER_Y = 952
-TICKER_H = 72
-TICKER_X = 96
-TICKER_W = W - TICKER_X - 12
+ICON_W = 140
+ICON_H = 132
+TEXT_X_OFFSET = 160
+TEXT_W = 306
 
 # ---------------------------------------------------------------------------
-# Embedded 5x7 bitmap font.  Digit zero has a slash so 0 != O.
+# 5x7 bitmap font.  Every glyph is seven rows of five pixels; '1' is ink.
+# Zero carries a diagonal slash so that it can never be read as the letter O.
 # ---------------------------------------------------------------------------
 
-FONT: dict[str, tuple[str, ...]] = {
-    "A": (".###.", "#...#", "#...#", "#####", "#...#", "#...#", "#...#"),
-    "B": ("####.", "#...#", "#...#", "####.", "#...#", "#...#", "####."),
-    "C": (".###.", "#...#", "#....", "#....", "#....", "#...#", ".###."),
-    "D": ("####.", "#...#", "#...#", "#...#", "#...#", "#...#", "####."),
-    "E": ("#####", "#....", "#....", "####.", "#....", "#....", "#####"),
-    "F": ("#####", "#....", "#....", "####.", "#....", "#....", "#...."),
-    "G": (".###.", "#...#", "#....", "#.###", "#...#", "#...#", ".###."),
-    "H": ("#...#", "#...#", "#...#", "#####", "#...#", "#...#", "#...#"),
-    "I": ("#####", "..#..", "..#..", "..#..", "..#..", "..#..", "#####"),
-    "J": ("..###", "...#.", "...#.", "...#.", "...#.", "#..#.", ".##.."),
-    "K": ("#...#", "#..#.", "#.#..", "##...", "#.#..", "#..#.", "#...#"),
-    "L": ("#....", "#....", "#....", "#....", "#....", "#....", "#####"),
-    "M": ("#...#", "##.##", "#.#.#", "#.#.#", "#...#", "#...#", "#...#"),
-    "N": ("#...#", "##..#", "#.#.#", "#..##", "#...#", "#...#", "#...#"),
-    "O": (".###.", "#...#", "#...#", "#...#", "#...#", "#...#", ".###."),
-    "P": ("####.", "#...#", "#...#", "####.", "#....", "#....", "#...."),
-    "Q": (".###.", "#...#", "#...#", "#...#", "#.#.#", "#..#.", ".##.#"),
-    "R": ("####.", "#...#", "#...#", "####.", "#.#..", "#..#.", "#...#"),
-    "S": (".####", "#....", "#....", ".###.", "....#", "....#", "####."),
-    "T": ("#####", "..#..", "..#..", "..#..", "..#..", "..#..", "..#.."),
-    "U": ("#...#", "#...#", "#...#", "#...#", "#...#", "#...#", ".###."),
-    "V": ("#...#", "#...#", "#...#", "#...#", "#...#", ".#.#.", "..#.."),
-    "W": ("#...#", "#...#", "#...#", "#.#.#", "#.#.#", "##.##", "#...#"),
-    "X": ("#...#", "#...#", ".#.#.", "..#..", ".#.#.", "#...#", "#...#"),
-    "Y": ("#...#", "#...#", ".#.#.", "..#..", "..#..", "..#..", "..#.."),
-    "Z": ("#####", "....#", "...#.", "..#..", ".#...", "#....", "#####"),
-    "0": (".###.", "#...#", "#..##", "#.#.#", "##..#", "#...#", ".###."),
-    "1": ("..#..", ".##..", "..#..", "..#..", "..#..", "..#..", ".###."),
-    "2": (".###.", "#...#", "....#", "...#.", "..#..", ".#...", "#####"),
-    "3": ("####.", "....#", "....#", ".###.", "....#", "....#", "####."),
-    "4": ("...#.", "..##.", ".#.#.", "#..#.", "#####", "...#.", "...#."),
-    "5": ("#####", "#....", "#....", "####.", "....#", "....#", "####."),
-    "6": (".###.", "#....", "#....", "####.", "#...#", "#...#", ".###."),
-    "7": ("#####", "....#", "...#.", "..#..", ".#...", ".#...", ".#..."),
-    "8": (".###.", "#...#", "#...#", ".###.", "#...#", "#...#", ".###."),
-    "9": (".###.", "#...#", "#...#", ".####", "....#", "....#", ".###."),
-    " ": (".....", ".....", ".....", ".....", ".....", ".....", "....."),
-    "-": (".....", ".....", ".....", "#####", ".....", ".....", "....."),
-    ".": (".....", ".....", ".....", ".....", ".....", ".##..", ".##.."),
-    ",": (".....", ".....", ".....", ".....", ".##..", ".##..", ".#..."),
-    ":": (".....", ".##..", ".##..", ".....", ".##..", ".##..", "....."),
-    ";": (".....", ".##..", ".##..", ".....", ".##..", ".##..", ".#..."),
-    "#": (".#.#.", ".#.#.", "#####", ".#.#.", "#####", ".#.#.", ".#.#."),
-    "/": ("....#", "...#.", "...#.", "..#..", ".#...", ".#...", "#...."),
-    "'": ("..#..", "..#..", ".....", ".....", ".....", ".....", "....."),
-    "&": (".##..", "#..#.", "#.#..", ".#...", "#.#.#", "#..#.", ".##.#"),
-    "?": (".###.", "#...#", "....#", "...#.", "..#..", ".....", "..#.."),
-    "!": ("..#..", "..#..", "..#..", "..#..", "..#..", ".....", "..#.."),
-    "+": (".....", "..#..", "..#..", "#####", "..#..", "..#..", "....."),
-    "(": ("...#.", "..#..", ".#...", ".#...", ".#...", "..#..", "...#."),
-    ")": (".#...", "..#..", "...#.", "...#.", "...#.", "..#..", ".#..."),
-    "|": ("..#..", "..#..", "..#..", "..#..", "..#..", "..#..", "..#.."),
-    "%": ("##..#", "##..#", "...#.", "..#..", ".#...", "#..##", "#..##"),
+FONT = {
+    " ": ("00000", "00000", "00000", "00000", "00000", "00000", "00000"),
+    "A": ("01110", "10001", "10001", "11111", "10001", "10001", "10001"),
+    "B": ("11110", "10001", "10001", "11110", "10001", "10001", "11110"),
+    "C": ("01111", "10000", "10000", "10000", "10000", "10000", "01111"),
+    "D": ("11110", "10001", "10001", "10001", "10001", "10001", "11110"),
+    "E": ("11111", "10000", "10000", "11110", "10000", "10000", "11111"),
+    "F": ("11111", "10000", "10000", "11110", "10000", "10000", "10000"),
+    "G": ("01111", "10000", "10000", "10111", "10001", "10001", "01111"),
+    "H": ("10001", "10001", "10001", "11111", "10001", "10001", "10001"),
+    "I": ("11111", "00100", "00100", "00100", "00100", "00100", "11111"),
+    "J": ("00111", "00010", "00010", "00010", "00010", "10010", "01100"),
+    "K": ("10001", "10010", "10100", "11000", "10100", "10010", "10001"),
+    "L": ("10000", "10000", "10000", "10000", "10000", "10000", "11111"),
+    "M": ("10001", "11011", "10101", "10101", "10001", "10001", "10001"),
+    "N": ("10001", "11001", "10101", "10011", "10001", "10001", "10001"),
+    "O": ("01110", "10001", "10001", "10001", "10001", "10001", "01110"),
+    "P": ("11110", "10001", "10001", "11110", "10000", "10000", "10000"),
+    "Q": ("01110", "10001", "10001", "10001", "10101", "10010", "01101"),
+    "R": ("11110", "10001", "10001", "11110", "10100", "10010", "10001"),
+    "S": ("01111", "10000", "10000", "01110", "00001", "00001", "11110"),
+    "T": ("11111", "00100", "00100", "00100", "00100", "00100", "00100"),
+    "U": ("10001", "10001", "10001", "10001", "10001", "10001", "01110"),
+    "V": ("10001", "10001", "10001", "10001", "10001", "01010", "00100"),
+    "W": ("10001", "10001", "10001", "10101", "10101", "10101", "01010"),
+    "X": ("10001", "10001", "01010", "00100", "01010", "10001", "10001"),
+    "Y": ("10001", "10001", "01010", "00100", "00100", "00100", "00100"),
+    "Z": ("11111", "00001", "00010", "00100", "01000", "10000", "11111"),
+    "0": ("01110", "10011", "10101", "10101", "10101", "11001", "01110"),
+    "1": ("00100", "01100", "00100", "00100", "00100", "00100", "01110"),
+    "2": ("01110", "10001", "00001", "00010", "00100", "01000", "11111"),
+    "3": ("11110", "00001", "00001", "01110", "00001", "00001", "11110"),
+    "4": ("00010", "00110", "01010", "10010", "11111", "00010", "00010"),
+    "5": ("11111", "10000", "10000", "11110", "00001", "00001", "11110"),
+    "6": ("01110", "10000", "10000", "11110", "10001", "10001", "01110"),
+    "7": ("11111", "00001", "00010", "00100", "01000", "01000", "01000"),
+    "8": ("01110", "10001", "10001", "01110", "10001", "10001", "01110"),
+    "9": ("01110", "10001", "10001", "01111", "00001", "00001", "01110"),
+    "-": ("00000", "00000", "00000", "11111", "00000", "00000", "00000"),
+    ",": ("00000", "00000", "00000", "00000", "00100", "00100", "01000"),
+    ".": ("00000", "00000", "00000", "00000", "00000", "01100", "01100"),
+    ":": ("00000", "00100", "00100", "00000", "00100", "00100", "00000"),
+    "#": ("01010", "01010", "11111", "01010", "11111", "01010", "01010"),
+    "/": ("00001", "00010", "00010", "00100", "01000", "01000", "10000"),
+    "|": ("00100", "00100", "00100", "00100", "00100", "00100", "00100"),
+    ";": ("00000", "00100", "00100", "00000", "00100", "00100", "01000"),
 }
 
-for _glyph in FONT.values():
-    assert len(_glyph) == 7 and all(len(_row) == 5 for _row in _glyph)
-
-
-def text_width(text: str, scale: int) -> int:
-    """Conservative advance width: 5 ink columns + 1 space, times scale."""
-    return len(text) * 6 * scale
+ALL_STRINGS = []
 
 
 # ---------------------------------------------------------------------------
-# Canvas primitives
+# Pixel primitives
 # ---------------------------------------------------------------------------
 
+def new_canvas():
+    return bytearray(WIDTH * HEIGHT * 3)
 
-class Canvas:
-    def __init__(self, width: int, height: int, bg: tuple[int, int, int]) -> None:
-        self.w = width
-        self.h = height
-        self.buf = bytearray(bytes(bg) * (width * height))
 
-    def px(self, x: int, y: int, color: tuple[int, int, int]) -> None:
-        if 0 <= x < self.w and 0 <= y < self.h:
-            i = (y * self.w + x) * 3
-            self.buf[i] = color[0]
-            self.buf[i + 1] = color[1]
-            self.buf[i + 2] = color[2]
+def put(canvas, x, y, color):
+    if 0 <= x < WIDTH and 0 <= y < HEIGHT:
+        i = (y * WIDTH + x) * 3
+        canvas[i] = color[0]
+        canvas[i + 1] = color[1]
+        canvas[i + 2] = color[2]
 
-    def rect(self, x: int, y: int, w: int, h: int, color: tuple[int, int, int]) -> None:
-        x0 = max(0, x)
-        y0 = max(0, y)
-        x1 = min(self.w, x + w)
-        y1 = min(self.h, y + h)
-        if x0 >= x1 or y0 >= y1:
-            return
-        row = bytes(color) * (x1 - x0)
-        for yy in range(y0, y1):
-            start = (yy * self.w + x0) * 3
-            self.buf[start : start + len(row)] = row
 
-    def poly(self, points: list[tuple[int, int]], color: tuple[int, int, int]) -> None:
-        """Even-odd scanline fill of an integer polygon."""
-        ys = [p[1] for p in points]
-        y0 = max(0, min(ys))
-        y1 = min(self.h - 1, max(ys))
-        n = len(points)
-        for y in range(y0, y1 + 1):
-            sample = y + 0.5
-            xs: list[float] = []
-            for i in range(n):
-                ax, ay = points[i]
-                bx, by = points[(i + 1) % n]
-                if (ay <= sample < by) or (by <= sample < ay):
-                    xs.append(ax + (sample - ay) * (bx - ax) / (by - ay))
-            xs.sort()
-            for k in range(0, len(xs) - 1, 2):
-                xa = int(xs[k] + 0.5)
-                xb = int(xs[k + 1] + 0.5)
-                self.rect(xa, y, xb - xa, 1, color)
+def rect(canvas, x, y, w, h, color):
+    if w <= 0 or h <= 0:
+        return
+    row = bytes(color) * w
+    for yy in range(max(0, y), min(HEIGHT, y + h)):
+        i = (yy * WIDTH + max(0, x)) * 3
+        end = (yy * WIDTH + min(WIDTH, x + w)) * 3
+        canvas[i:end] = row[: end - i]
 
-    def line(
-        self,
-        x0: int,
-        y0: int,
-        x1: int,
-        y1: int,
-        color: tuple[int, int, int],
-        thickness: int = 1,
-    ) -> None:
-        """Integer Bresenham line with optional square thickness."""
-        dx = abs(x1 - x0)
-        dy = abs(y1 - y0)
-        sx = 1 if x0 < x1 else -1
-        sy = 1 if y0 < y1 else -1
-        err = dx - dy
-        half = thickness // 2
-        while True:
-            self.rect(x0 - half, y0 - half, thickness, thickness, color)
-            if x0 == x1 and y0 == y1:
-                break
-            e2 = 2 * err
-            if e2 > -dy:
-                err -= dy
-                x0 += sx
-            if e2 < dx:
-                err += dx
-                y0 += sy
 
-    def disc(self, cx: int, cy: int, r: int, color: tuple[int, int, int]) -> None:
-        for dy in range(-r, r + 1):
-            span = math.isqrt(r * r - dy * dy)
-            self.rect(cx - span, cy + dy, 2 * span + 1, 1, color)
+def frame(canvas, x, y, w, h, color):
+    rect(canvas, x, y, w, 1, color)
+    rect(canvas, x, y + h - 1, w, 1, color)
+    rect(canvas, x, y, 1, h, color)
+    rect(canvas, x + w - 1, y, 1, h, color)
 
-    def text(
-        self,
-        x: int,
-        y: int,
-        text: str,
-        scale: int,
-        color: tuple[int, int, int],
-        max_width: int | None = None,
-    ) -> int:
-        width = text_width(text, scale)
-        if max_width is not None and width > max_width:
-            raise ValueError(f"line too wide ({width} > {max_width}): {text!r}")
-        for index, char in enumerate(text):
-            glyph = FONT.get(char, FONT["?"])
-            gx = x + index * 6 * scale
-            for row, bits in enumerate(glyph):
-                for col, bit in enumerate(bits):
-                    if bit == "#":
-                        self.rect(gx + col * scale, y + row * scale, scale, scale, color)
-        return width
 
-    def text_center(
-        self,
-        cx: int,
-        y: int,
-        text: str,
-        scale: int,
-        color: tuple[int, int, int],
-        max_width: int | None = None,
-    ) -> int:
-        return self.text(cx - text_width(text, scale) // 2, y, text, scale, color, max_width)
+def hline(canvas, x, y, w, color, thick=1):
+    rect(canvas, x, y, w, thick, color)
+
+
+def vline(canvas, x, y, h, color, thick=1):
+    rect(canvas, x, y, thick, h, color)
+
+
+def line(canvas, x0, y0, x1, y1, color, thick=2):
+    steps = max(abs(x1 - x0), abs(y1 - y0))
+    if steps == 0:
+        rect(canvas, x0 - thick // 2, y0 - thick // 2, thick, thick, color)
+        return
+    for i in range(steps + 1):
+        px = round(x0 + (x1 - x0) * i / steps)
+        py = round(y0 + (y1 - y0) * i / steps)
+        rect(canvas, px - thick // 2, py - thick // 2, thick, thick, color)
+
+
+def polygon(canvas, points, color):
+    ys = [p[1] for p in points]
+    for yy in range(max(0, math.floor(min(ys))), min(HEIGHT, math.ceil(max(ys)) + 1)):
+        xs = []
+        for i, (xa, ya) in enumerate(points):
+            xb, yb = points[(i + 1) % len(points)]
+            if ya == yb:
+                continue
+            if min(ya, yb) <= yy < max(ya, yb):
+                xs.append(xa + (yy - ya) * (xb - xa) / (yb - ya))
+        xs.sort()
+        for i in range(0, len(xs) - 1, 2):
+            left = math.ceil(xs[i])
+            right = math.floor(xs[i + 1])
+            rect(canvas, left, yy, right - left + 1, 1, color)
+
+
+def disc(canvas, cx, cy, radius, color):
+    for dy in range(-radius, radius + 1):
+        half = int(math.sqrt(max(0, radius * radius - dy * dy)))
+        rect(canvas, cx - half, cy + dy, 2 * half + 1, 1, color)
+
+
+def mix(a, b, t):
+    return tuple(round(a[i] * (1 - t) + b[i] * t) for i in range(3))
 
 
 # ---------------------------------------------------------------------------
-# Story data: all labels are short, uppercase and faithful to the brief.
+# Text: measured before it is drawn, and every string is registered so the
+# final date sweep can inspect exactly what reached the page.
 # ---------------------------------------------------------------------------
 
-STORIES: list[dict[str, object]] = [
-    {
-        "region": "EUROPE",
-        "color": (140, 29, 24),
-        "icon": "ship",
-        "head": ("UKRAINIAN DRONES", "HIT CARGO SHIP", "SPARTA II"),
-        "sub": (
-            "GULF OF FINLAND; SHIP ABLAZE",
-            "FINLAND PM: WAR SPILLING",
-            "OVER INTO THE BALTIC",
-        ),
-        "chip": "BALTIC FIRE",
-    },
-    {
-        "region": "NATO",
-        "color": (29, 60, 106),
-        "icon": "shield",
-        "head": ("RUSSIAN MISSILES", "LANDED IN POLAND", "NATO VOWS DEFENSE"),
-        "sub": (
-            "CHIEF RUTTE PLEDGES TO",
-            "DEFEND POLAND",
-            "ALLIANCE TOP BODY MEETS",
-        ),
-        "chip": "DEFENSE PLEDGE",
-    },
-    {
-        "region": "IRAN-US",
-        "color": (107, 78, 18),
-        "icon": "jet",
-        "head": ("IRAN CLAIMS HIT ON", "US F-16 OVER GULF", "US DENIES DAMAGE"),
-        "sub": (
-            "IRAN: AIR-DEFENSE MISSILE",
-            "DAMAGED JET; US DENIES",
-            "TRUMP DEFERS STRIKE CALL",
-        ),
-        "chip": "AFTER NEW YEAR",
-    },
-    {
-        "region": "UKRAINE",
-        "color": (31, 94, 100),
-        "icon": "bridge",
-        "head": ("KERCH BRIDGE", "PARTLY DESTROYED", "UKRAINIAN STRIKES"),
-        "sub": (
-            "CRIMEAN CROSSING HIT;",
-            "RUSSIAN LOGISTICS",
-            "SUPPLY LINE STRAINED",
-        ),
-        "chip": "BRIDGE DAMAGE",
-    },
-    {
-        "region": "WORLD COURT",
-        "color": (75, 46, 112),
-        "icon": "scales",
-        "head": ("UN COURT RULES", "ON MYANMAR", "GENOCIDE CASE"),
-        "sub": (
-            "EU PRAISES; US CAUTIOUS,",
-            "CHINA CRITICAL",
-            "DEEP DIVISIONS OVER ICJ",
-        ),
-        "chip": "WORLD DIVIDED",
-    },
-    {
-        "region": "SUMMIT",
-        "color": (110, 43, 69),
-        "icon": "flags",
-        "head": ("TRUMP, XI, PUTIN", "SUMMIT ENDS;", "INDIA TAKES NOTE"),
-        "sub": (
-            "NEW DELHI AWAITS",
-            "FURTHER DETAILS",
-            "OF THE TALKS",
-        ),
-        "chip": "TRILATERAL TALKS",
-    },
-    {
-        "region": "MIDEAST",
-        "color": (138, 78, 18),
-        "icon": "tanker",
-        "head": ("IRAN STRIKES", "TANKERS; GAZA", "AID TRUCK HIT"),
-        "sub": (
-            "ISRAELI STRIKE ON A",
-            "GAZA FOOD TRUCK",
-            "KILLS THREE",
-        ),
-        "chip": "AID TRUCK STRIKE",
-    },
-    {
-        "region": "SPORTS",
-        "color": (30, 90, 59),
-        "icon": "trophy",
-        "head": ("PSG WIN 3-2, NICE", "NEBRASKA 31", "BEATS #14 OHIO ST."),
-        "sub": (
-            "LIGUE 1: PSG COMEBACK",
-            "COLLEGE FOOTBALL RESULT",
-            "NBA: MIL 129 - PHI 132",
-        ),
-        "chip": "FINAL SCORES",
-    },
-]
+def text_width(value, scale):
+    if not value:
+        return 0
+    return (len(value) * 6 - 1) * scale
 
-TICKER = (
-    "BALTIC SHIP FIRE | NATO DEFENDS POLAND | F-16 CLAIM DENIED | INDIA AWAITS",
-    "KERCH BRIDGE DAMAGED | ICJ RULING DIVIDES | PSG 3-2, NEB 31 | GAZA TRUCK",
+
+def text(canvas, x, y, value, scale, color, max_width=None):
+    if value != value.upper():
+        raise ValueError("font is uppercase only: %r" % value)
+    for ch in value:
+        if ch not in FONT:
+            raise ValueError("missing glyph %r in %r" % (ch, value))
+    width = text_width(value, scale)
+    if max_width is not None and width > max_width:
+        raise ValueError("text overflow: %r is %d px, limit %d px" % (value, width, max_width))
+    if x < 0 or y < 0 or x + width > WIDTH or y + 7 * scale > HEIGHT:
+        raise ValueError("text off canvas: %r at (%d,%d)" % (value, x, y))
+    ALL_STRINGS.append(value)
+    for pos, ch in enumerate(value):
+        glyph = FONT[ch]
+        for row, bits in enumerate(glyph):
+            for col, bit in enumerate(bits):
+                if bit == "1":
+                    rect(canvas, x + (pos * 6 + col) * scale, y + row * scale, scale, scale, color)
+    return width
+
+
+def centered_text(canvas, cy, value, scale, color, max_width):
+    width = text_width(value, scale)
+    if width > max_width:
+        raise ValueError("text overflow: %r is %d px, limit %d px" % (value, width, max_width))
+    text(canvas, (WIDTH - width) // 2, cy, value, scale, color, max_width)
+
+
+# ---------------------------------------------------------------------------
+# Pictograms: flat, label-free shapes that fill the 140x132 icon panels.
+# ---------------------------------------------------------------------------
+
+def icon_ship(canvas, x, y, dark, hot):
+    for dy in (108, 117, 126):
+        rect(canvas, x + 10, y + dy, 120, 3, dark)
+    polygon(canvas, [(x + 12, y + 76), (x + 128, y + 76),
+                     (x + 112, y + 104), (x + 28, y + 104)], dark)
+    rect(canvas, x + 22, y + 83, 96, 4, hot)
+    rect(canvas, x + 54, y + 54, 38, 22, dark)
+    rect(canvas, x + 62, y + 47, 20, 7, dark)
+    rect(canvas, x + 71, y + 26, 3, 21, dark)
+    polygon(canvas, [(x + 18, y + 30), (x + 40, y + 26), (x + 30, y + 40)], hot)
+    line(canvas, x + 30, y + 27, x + 30, y + 43, dark, 2)
+    polygon(canvas, [(x + 100, y + 22), (x + 122, y + 28), (x + 106, y + 38)], hot)
+    line(canvas, x + 112, y + 25, x + 108, y + 42, dark, 2)
+    polygon(canvas, [(x + 56, y + 54), (x + 66, y + 28), (x + 74, y + 54)], FIRE)
+    polygon(canvas, [(x + 76, y + 54), (x + 88, y + 34), (x + 94, y + 54)], GOLD)
+    polygon(canvas, [(x + 88, y + 54), (x + 98, y + 40), (x + 104, y + 54)], FIRE)
+
+
+def icon_nato(canvas, x, y, dark, hot):
+    polygon(canvas, [(x + 70, y + 12), (x + 122, y + 30), (x + 118, y + 76),
+                     (x + 70, y + 116), (x + 22, y + 76), (x + 18, y + 30)], dark)
+    polygon(canvas, [(x + 70, y + 24), (x + 110, y + 38), (x + 107, y + 72),
+                     (x + 70, y + 102), (x + 33, y + 72), (x + 30, y + 38)], hot)
+    polygon(canvas, [(x + 70, y + 36), (x + 78, y + 54), (x + 98, y + 54),
+                     (x + 82, y + 66), (x + 88, y + 86), (x + 70, y + 74),
+                     (x + 52, y + 86), (x + 58, y + 66), (x + 42, y + 54),
+                     (x + 62, y + 54)], dark)
+    line(canvas, x + 20, y + 8, x + 30, y + 22, dark, 3)
+    line(canvas, x + 120, y + 8, x + 110, y + 22, dark, 3)
+
+
+def icon_jet(canvas, x, y, dark, hot):
+    polygon(canvas, [(x + 8, y + 44), (x + 60, y + 34), (x + 102, y + 42),
+                     (x + 130, y + 52), (x + 104, y + 58), (x + 78, y + 70),
+                     (x + 56, y + 66), (x + 40, y + 54), (x + 8, y + 56)], dark)
+    polygon(canvas, [(x + 60, y + 34), (x + 52, y + 14), (x + 76, y + 36)], dark)
+    line(canvas, x + 22, y + 112, x + 80, y + 62, hot, 5)
+    polygon(canvas, [(x + 80, y + 62), (x + 68, y + 60), (x + 78, y + 50)], hot)
+    points = []
+    for i in range(12):
+        angle = i * math.pi / 6
+        radius = 18 if i % 2 == 0 else 7
+        points.append((x + 86 + math.cos(angle) * radius, y + 58 + math.sin(angle) * radius))
+    polygon(canvas, points, FIRE)
+    disc(canvas, x + 86, y + 58, 5, dark)
+
+
+def icon_bridge(canvas, x, y, dark, hot):
+    for dy in (106, 116, 126):
+        rect(canvas, x + 8, y + dy, 124, 3, dark)
+    rect(canvas, x + 28, y + 28, 12, 76, dark)
+    rect(canvas, x + 100, y + 28, 12, 76, dark)
+    rect(canvas, x + 20, y + 84, 46, 10, dark)
+    rect(canvas, x + 74, y + 84, 46, 10, dark)
+    polygon(canvas, [(x + 66, y + 84), (x + 74, y + 78), (x + 70, y + 90),
+                     (x + 78, y + 86), (x + 74, y + 96)], hot)
+    for left in (34, 106):
+        for k in range(3):
+            line(canvas, x + left, y + 34, x + left - 26 + k * 13, y + 82, dark, 2)
+            line(canvas, x + left, y + 34, x + left + 26 - k * 13, y + 82, dark, 2)
+    line(canvas, x + 20, y + 26, x + 120, y + 26, dark, 4)
+    polygon(canvas, [(x + 60, y + 54), (x + 70, y + 42), (x + 76, y + 58),
+                     (x + 68, y + 68)], FIRE)
+
+
+def icon_scales(canvas, x, y, dark, hot):
+    disc(canvas, x + 70, y + 66, 44, hot)
+    rect(canvas, x + 44, y + 112, 52, 8, dark)
+    rect(canvas, x + 67, y + 24, 6, 88, dark)
+    rect(canvas, x + 26, y + 36, 88, 6, dark)
+    disc(canvas, x + 70, y + 26, 7, dark)
+    for cx in (38, 102):
+        line(canvas, x + cx, y + 42, x + cx, y + 76, dark, 2)
+        polygon(canvas, [(x + cx - 22, y + 76), (x + cx + 22, y + 76),
+                         (x + cx + 14, y + 94), (x + cx - 14, y + 94)], dark)
+    rect(canvas, x + 32, y + 104, 76, 5, dark)
+
+
+def icon_summit(canvas, x, y, dark, hot):
+    rect(canvas, x + 10, y + 92, 120, 14, dark)
+    rect(canvas, x + 18, y + 106, 104, 8, hot)
+    figures = ((34, 54, 20), (70, 46, 24), (106, 54, 20))
+    for cx, top, height in figures:
+        disc(canvas, x + cx, y + top, 10, dark)
+        rect(canvas, x + cx - 15, y + top + 12, 30, height, dark)
+    for cx, flag_color in ((34, dark), (70, hot), (106, FIRE)):
+        rect(canvas, x + cx, y + 12, 2, 28, dark)
+        polygon(canvas, [(x + cx + 2, y + 13), (x + cx + 22, y + 19),
+                         (x + cx + 2, y + 25)], flag_color)
+    rect(canvas, x + 30, y + 82, 80, 4, hot)
+
+
+def icon_tankers(canvas, x, y, dark, hot):
+    polygon(canvas, [(x + 8, y + 34), (x + 132, y + 34),
+                     (x + 118, y + 60), (x + 22, y + 60)], dark)
+    rect(canvas, x + 24, y + 18, 22, 16, dark)
+    for start in (52, 78, 104):
+        rect(canvas, x + start, y + 18, 18, 16, hot)
+    for dy in (66, 74):
+        rect(canvas, x + 14, y + dy, 112, 3, dark)
+    rect(canvas, x + 22, y + 88, 32, 28, dark)
+    rect(canvas, x + 54, y + 80, 58, 36, dark)
+    rect(canvas, x + 60, y + 86, 46, 8, hot)
+    disc(canvas, x + 34, y + 118, 7, dark)
+    disc(canvas, x + 92, y + 118, 7, dark)
+    points = []
+    for i in range(12):
+        angle = i * math.pi / 6
+        radius = 16 if i % 2 == 0 else 6
+        points.append((x + 118 + math.cos(angle) * radius,
+                       y + 82 + math.sin(angle) * radius))
+    polygon(canvas, points, FIRE)
+
+
+def icon_sports(canvas, x, y, dark, hot):
+    disc(canvas, x + 50, y + 52, 38, dark)
+    polygon(canvas, [(x + 50, y + 36), (x + 64, y + 46), (x + 59, y + 62),
+                     (x + 41, y + 62), (x + 36, y + 46)], hot)
+    for point in ((x + 50, y + 18), (x + 84, y + 44), (x + 72, y + 80),
+                  (x + 28, y + 80), (x + 16, y + 44)):
+        line(canvas, point[0], point[1], x + 50, y + 52, hot, 3)
+    polygon(canvas, [(x + 82, y + 98), (x + 98, y + 82), (x + 124, y + 88),
+                     (x + 132, y + 104), (x + 116, y + 118), (x + 90, y + 114)], dark)
+    line(canvas, x + 102, y + 85, x + 112, y + 113, hot, 4)
+    rect(canvas, x + 18, y + 110, 60, 6, dark)
+    rect(canvas, x + 24, y + 122, 48, 4, hot)
+
+
+ICONS = (icon_ship, icon_nato, icon_jet, icon_bridge,
+         icon_scales, icon_summit, icon_tankers, icon_sports)
+
+# ---------------------------------------------------------------------------
+# The eight stories.  Headlines stay at or below 16 characters so scale-3
+# glyphs fit the 306 px text column; details/status lines are measured too.
+# ---------------------------------------------------------------------------
+
+STORIES = (
+    {
+        "label": "EUROPE",
+        "accent": (35, 72, 116),
+        "second": GOLD,
+        "head": ("UKRAINIAN DRONES", "HIT SPARTA II"),
+        "detail": ("RUSSIAN SHIP ABLAZE", "IN GULF OF FINLAND"),
+        "status": "PM: WAR SPILLS TO BALTIC",
+    },
+    {
+        "label": "NATO",
+        "accent": (29, 58, 92),
+        "second": (104, 152, 196),
+        "head": ("RUTTE PLEDGES", "TO DEFEND POLAND"),
+        "detail": ("RUSSIAN MISSILES", "LANDED IN POLAND"),
+        "status": "ALLIANCE TOP BODY MEETS",
+    },
+    {
+        "label": "IRAN-US",
+        "accent": (124, 55, 43),
+        "second": GOLD,
+        "head": ("IRAN CLAIMS HIT", "ON US F-16 JET"),
+        "detail": ("MISSILE OVER GULF", "US DENIES DAMAGE"),
+        "status": "DECISION AFTER NEW YEAR",
+    },
+    {
+        "label": "UKRAINE",
+        "accent": (26, 84, 140),
+        "second": GOLD,
+        "head": ("KERCH BRIDGE HIT", "PARTLY DESTROYED"),
+        "detail": ("UKRAINIAN STRIKES", "CRIMEAN CROSSING"),
+        "status": "RUSSIAN SUPPLY STRAINED",
+    },
+    {
+        "label": "WORLD COURT",
+        "accent": (86, 62, 120),
+        "second": (186, 166, 214),
+        "head": ("ICJ RULES ON", "MYANMAR GENOCIDE"),
+        "detail": ("EU PRAISES, US CAUTIOUS", "CHINA CRITICAL"),
+        "status": "DIVIDED OVER THE COURT",
+    },
+    {
+        "label": "TRILATERAL",
+        "accent": (110, 74, 34),
+        "second": GOLD,
+        "head": ("TRUMP-XI-PUTIN", "SUMMIT WRAPS UP"),
+        "detail": ("INDIA TAKES NOTE", "AWAITS DETAILS"),
+        "status": "INDIA AWAITS DETAILS",
+    },
+    {
+        "label": "MIDEAST",
+        "accent": (150, 70, 28),
+        "second": (232, 178, 92),
+        "head": ("TANKERS STRUCK", "IN IRAN ATTACKS"),
+        "detail": ("ISRAELI HIT ON", "GAZA FOOD TRUCK"),
+        "status": "3 KILLED IN GAZA HIT",
+    },
+    {
+        "label": "SPORTS",
+        "accent": (30, 100, 66),
+        "second": GOLD,
+        "head": ("PSG COMES BACK", "3-2 AT NICE"),
+        "detail": ("NEBRASKA 31,", "VS #14 OHIO STATE"),
+        "status": "NBA MIL 129 - PHI 132",
+    },
 )
 
-# ---------------------------------------------------------------------------
-# Pictograms (flat rectangles / polygons in a 98x136 local box)
-# ---------------------------------------------------------------------------
-
-
-def draw_icon(
-    canvas: Canvas, ox: int, oy: int, kind: str, accent: tuple[int, int, int]
-) -> None:
-    def R(dx: int, dy: int, w: int, h: int, color: tuple[int, int, int]) -> None:
-        canvas.rect(ox + dx, oy + dy, w, h, color)
-
-    def L(
-        x0: int,
-        y0: int,
-        x1: int,
-        y1: int,
-        color: tuple[int, int, int],
-        thickness: int = 1,
-    ) -> None:
-        canvas.line(ox + x0, oy + y0, ox + x1, oy + y1, color, thickness)
-
-    def P(pts: list[tuple[int, int]], color: tuple[int, int, int]) -> None:
-        canvas.poly([(ox + px, oy + py) for px, py in pts], color)
-
-    def D(cx: int, cy: int, r: int, color: tuple[int, int, int]) -> None:
-        canvas.disc(ox + cx, oy + cy, r, color)
-
-    if kind == "ship":
-        for yy in (110, 120, 130):
-            R(2, yy, 94, 2, WATER)
-        R(18, 83, 62, 9, INK)
-        R(21, 85, 56, 5, ICON_LIGHT)
-        R(30, 68, 28, 16, INK)
-        for wx in (34, 43, 52):
-            R(wx, 72, 4, 4, ICON_LIGHT)
-        R(44, 54, 2, 14, INK)
-        P([(45, 68), (39, 56), (46, 59), (49, 44), (58, 60), (54, 68)], RED)
-        P([(48, 66), (45, 58), (50, 60), (52, 52), (56, 64), (53, 66)], GOLD)
-        P([(6, 92), (92, 92), (82, 110), (16, 110)], INK)
-
-    elif kind == "shield":
-        L(6, 10, 30, 30, RED, 2)
-        P([(30, 30), (24, 28), (27, 24)], RED)
-        P([(49, 20), (84, 32), (81, 76), (49, 108), (17, 76), (14, 32)], INK)
-        P([(49, 26), (78, 36), (75, 73), (49, 100), (23, 73), (20, 36)], ICON_LIGHT)
-        P(
-            [
-                (49, 38), (55, 54), (72, 54), (58, 64), (64, 80),
-                (49, 70), (34, 80), (40, 64), (26, 54), (43, 54),
-            ],
-            accent,
-        )
-
-    elif kind == "jet":
-        L(68, 52, 62, 72, RED, 2)
-        P(
-            [
-                (70, 18), (74, 32), (88, 28), (78, 40), (88, 52),
-                (74, 48), (70, 62), (66, 48), (52, 52), (62, 40),
-                (52, 28), (66, 32),
-            ],
-            RED,
-        )
-        P(
-            [
-                (49, 6), (55, 28), (60, 44), (90, 68), (90, 78),
-                (60, 68), (58, 92), (70, 108), (70, 114), (49, 106),
-                (28, 114), (28, 108), (40, 92), (38, 68), (8, 78),
-                (8, 68), (38, 44), (43, 28),
-            ],
-            INK,
-        )
-        P([(49, 20), (53, 34), (45, 34)], GOLD)
-
-    elif kind == "bridge":
-        for yy in (112, 122, 132):
-            R(2, yy, 94, 2, WATER)
-        R(8, 52, 14, 62, INK)
-        R(76, 52, 14, 62, INK)
-        R(5, 52, 20, 4, INK)
-        R(73, 52, 20, 4, INK)
-        L(16, 56, 44, 88, INK, 2)
-        L(84, 56, 56, 88, INK, 2)
-        P([(4, 90), (45, 90), (41, 100), (4, 100)], INK)
-        P([(53, 90), (94, 90), (94, 100), (57, 100)], INK)
-        P([(45, 90), (41, 100), (38, 94)], RED)
-        P([(53, 90), (57, 100), (60, 94)], RED)
-        R(12, 100, 6, 12, INK)
-        R(80, 100, 6, 12, INK)
-
-    elif kind == "scales":
-        D(49, 14, 4, INK)
-        R(46, 16, 6, 10, INK)
-        R(14, 24, 70, 6, INK)
-        R(46, 30, 6, 84, INK)
-        R(34, 114, 30, 8, INK)
-        L(20, 30, 10, 66, INK, 2)
-        L(20, 30, 30, 66, INK, 2)
-        L(78, 30, 68, 66, INK, 2)
-        L(78, 30, 88, 66, INK, 2)
-        P([(8, 66), (32, 66), (28, 78), (12, 78)], accent)
-        P([(66, 66), (90, 66), (86, 78), (70, 78)], accent)
-
-    elif kind == "flags":
-        R(8, 96, 82, 8, INK)
-        R(18, 104, 6, 22, INK)
-        R(74, 104, 6, 22, INK)
-        L(24, 20, 24, 96, INK, 2)
-        L(49, 12, 49, 96, INK, 2)
-        L(74, 20, 74, 96, INK, 2)
-        P([(24, 20), (44, 26), (24, 32)], RED)
-        P([(49, 12), (69, 19), (49, 26)], INK)
-        P([(74, 20), (94, 26), (74, 32)], GOLD)
-
-    elif kind == "tanker":
-        for yy in (112, 122, 132):
-            R(2, yy, 94, 2, WATER)
-        R(12, 90, 74, 4, INK)
-        for cx in (30, 54, 78):
-            D(cx, 82, 11, INK)
-            D(cx, 82, 9, ICON_LIGHT)
-        L(68, 52, 62, 72, RED, 2)
-        P(
-            [
-                (70, 18), (74, 32), (88, 28), (78, 40), (88, 52),
-                (74, 48), (70, 62), (66, 48), (52, 52), (62, 40),
-                (52, 28), (66, 32),
-            ],
-            RED,
-        )
-        P([(5, 94), (93, 94), (83, 112), (15, 112)], INK)
-
-    elif kind == "trophy":
-        L(18, 36, 8, 36, INK, 3)
-        L(8, 36, 8, 52, INK, 3)
-        L(8, 52, 18, 52, INK, 3)
-        L(72, 36, 82, 36, INK, 3)
-        L(82, 36, 82, 52, INK, 3)
-        L(82, 52, 72, 52, INK, 3)
-        P([(18, 30), (72, 30), (66, 66), (54, 78), (36, 78), (24, 66)], INK)
-        P([(24, 36), (66, 36), (61, 62), (52, 70), (38, 70), (29, 62)], GOLD)
-        R(43, 78, 6, 16, INK)
-        R(32, 94, 28, 8, INK)
-        R(26, 102, 40, 6, INK)
-        D(82, 110, 12, INK)
-        D(82, 110, 10, PAPER)
-        P([(82, 102), (89, 107), (86, 115), (78, 115), (75, 107)], accent)
-
-    else:
-        raise ValueError(f"unknown icon: {kind}")
+TICKER_LINES = (
+    "BALTIC SPILL  |  POLAND DEFENSE  |  KERCH BRIDGE  |  ICJ SPLIT  |  F-16 DENIED",
+    "TRUMP DEFERS  |  3 DEAD IN GAZA  |  PSG 3-2  |  NEB 31  |  MIL 129 - PHI 132",
+)
 
 
 # ---------------------------------------------------------------------------
-# Layout
+# Page assembly
 # ---------------------------------------------------------------------------
 
+def draw_masthead(canvas):
+    hline(canvas, MARGIN, 12, WIDTH - 2 * MARGIN, INK, 2)
+    hline(canvas, MARGIN, 17, WIDTH - 2 * MARGIN, INK, 1)
+    centered_text(canvas, 28, "WORLD NEWS", 8, INK, 700)
+    hline(canvas, MARGIN, 90, WIDTH - 2 * MARGIN, RULE, 2)
 
-def draw_card(canvas: Canvas, x: int, y: int, story: dict[str, object]) -> None:
-    color = story["color"]
-    canvas.rect(x, y, CARD_W, CARD_H, PAPER)
-
-    # Region header bar.
-    canvas.rect(x, y, CARD_W, 30, color)
-    canvas.text(x + 10, y + 5, str(story["region"]), 3, PAPER, max_width=CARD_W - 20)
-
-    # Pictogram panel.
-    bx = x + 8
-    by = y + 38
-    canvas.rect(bx, by, ICON_W, ICON_H, ICON_BG)
-    canvas.rect(bx, by, ICON_W, 1, BORDER)
-    canvas.rect(bx, by + ICON_H - 1, ICON_W, 1, BORDER)
-    canvas.rect(bx, by, 1, ICON_H, BORDER)
-    canvas.rect(bx + ICON_W - 1, by, 1, ICON_H, BORDER)
-    draw_icon(canvas, bx + 7, by + 7, str(story["icon"]), color)
-    canvas.rect(x + 124, y + 38, 1, ICON_H, BORDER)
-
-    # Three headline lines and three explanatory lines.
-    tx = x + TEXT_X
-    for index, line in enumerate(story["head"]):
-        canvas.text(tx, y + 34 + index * 26, line, 3, INK, max_width=TEXT_W)
-    for index, line in enumerate(story["sub"]):
-        canvas.text(tx, y + 114 + index * 18, line, 2, SUBINK, max_width=TEXT_W)
-
-    # Status chip closes the bottom of the card.
-    chip = str(story["chip"])
-    chip_w = text_width(chip, 2) + 14
-    canvas.rect(tx, y + 170, chip_w, 20, color)
-    canvas.text(tx + 7, y + 173, chip, 2, PAPER, max_width=chip_w - 14)
+    rect(canvas, MARGIN, 98, WIDTH - 2 * MARGIN, 50, DARK)
+    rect(canvas, MARGIN + 18, 112, 18, 22, GOLD)
+    rect(canvas, WIDTH - MARGIN - 36, 112, 18, 22, GOLD)
+    centered_text(canvas, 105, DATE, 5, WHITE, 900)
+    hline(canvas, MARGIN, 158, WIDTH - 2 * MARGIN, INK, 2)
 
 
-def render() -> Canvas:
-    canvas = Canvas(W, H, PAPER)
+def draw_card(canvas, story, index, cx, cy):
+    accent = story["accent"]
+    rect(canvas, cx, cy, COL_W, CARD_H, PANEL)
+    frame(canvas, cx, cy, COL_W, CARD_H, RULE)
 
-    # Masthead.
-    canvas.rect(0, 0, W, 8, INK)
-    canvas.text_center(W // 2, 16, "WORLD NEWS", 10, INK, max_width=W - 40)
-    canvas.rect(0, 88, W, 4, INK)
-    canvas.rect(0, 94, W, 56, RED)
-    canvas.text_center(W // 2, 98, DATE_TEXT, 7, PAPER, max_width=W - 40)
-    canvas.rect(0, 152, W, 4, INK)
-    canvas.rect(0, 156, W, 2, PAPER)
+    rect(canvas, cx + 1, cy + 1, COL_W - 2, 30, accent)
+    text(canvas, cx + 12, cy + 5, story["label"], 3, WHITE, 440)
 
-    # 2 columns x 4 rows of story cards.
+    ix = cx + 10
+    iy = cy + 38
+    rect(canvas, ix, iy, ICON_W, ICON_H, mix(accent, PAPER, 0.86))
+    frame(canvas, ix, iy, ICON_W, ICON_H, mix(accent, PAPER, 0.55))
+    ICONS[index](canvas, ix + 2, iy + 2, mix(accent, DARK, 0.18), story["second"])
+
+    tx = cx + TEXT_X_OFFSET
+    text(canvas, tx, cy + 40, story["head"][0], 3, INK, TEXT_W)
+    text(canvas, tx, cy + 64, story["head"][1], 3, INK, TEXT_W)
+    text(canvas, tx, cy + 94, story["detail"][0], 2, MUTED, TEXT_W)
+    text(canvas, tx, cy + 112, story["detail"][1], 2, MUTED, TEXT_W)
+
+    rect(canvas, tx, cy + 136, TEXT_W, 32, accent)
+    text(canvas, tx + 8, cy + 145, story["status"], 2, WHITE, TEXT_W - 16)
+
+
+def draw_ticker(canvas):
+    rect(canvas, MARGIN, 948, WIDTH - 2 * MARGIN, 56, DARK)
+    centered_text(canvas, 954, TICKER_LINES[0], 2, WHITE, WIDTH - 2 * MARGIN - 24)
+    hline(canvas, MARGIN + 16, 973, WIDTH - 2 * MARGIN - 32, GOLD, 1)
+    centered_text(canvas, 980, TICKER_LINES[1], 2, WHITE, WIDTH - 2 * MARGIN - 24)
+
+
+def validate_strings():
+    if ALL_STRINGS.count(DATE) != 1:
+        raise ValueError("the contest date must be rendered exactly once")
+    months = ("JANUARY", "FEBRUARY", "MARCH", "APRIL", "MAY", "JUNE", "JULY",
+              "AUGUST", "SEPTEMBER", "OCTOBER", "NOVEMBER", "DECEMBER")
+    for value in ALL_STRINGS:
+        if value == DATE:
+            continue
+        for month in months:
+            if month in value:
+                raise ValueError("unexpected date-like month in %r" % value)
+        if re.search(r"(?:19|20)[0-9]{2}", value):
+            raise ValueError("unexpected year in %r" % value)
+
+
+def render():
+    ALL_STRINGS.clear()
+    canvas = new_canvas()
+    rect(canvas, 0, 0, WIDTH, HEIGHT, PAPER)
+    draw_masthead(canvas)
     for index, story in enumerate(STORIES):
         col = index % 2
         row = index // 2
-        x = GRID_X + col * (CARD_W + GUTTER_X)
-        y = GRID_Y + row * (CARD_H + GUTTER_Y)
-        draw_card(canvas, x, y, story)
-
-    # Bottom wire strip.  Scores and keywords only: no dates.
-    canvas.rect(0, TICKER_Y, W, TICKER_H, INK)
-    canvas.rect(0, TICKER_Y, 84, TICKER_H, RED)
-    canvas.text_center(42, TICKER_Y + 25, "WIRE", 3, PAPER, max_width=76)
-    for index, line in enumerate(TICKER):
-        canvas.text(TICKER_X, TICKER_Y + 18 + index * 24, line, 2, PAPER, max_width=TICKER_W)
-
+        draw_card(canvas, story, index, COL_X[col], ROW_Y[row])
+    draw_ticker(canvas)
+    validate_strings()
     return canvas
 
 
 # ---------------------------------------------------------------------------
-# Validation: sweep the defect checklist before writing any bytes.
+# PNG encoder (RGB, 8 bit, no ancillary chunks and therefore no timestamps)
 # ---------------------------------------------------------------------------
 
-
-def all_rendered_text() -> list[str]:
-    strings: list[str] = ["WORLD NEWS", DATE_TEXT, "WIRE"]
-    for story in STORIES:
-        strings.append(str(story["region"]))
-        strings.extend(story["head"])
-        strings.extend(story["sub"])
-        strings.append(str(story["chip"]))
-    strings.extend(TICKER)
-    return strings
+def chunk(tag, payload):
+    body = tag + payload
+    return struct.pack(">I", len(payload)) + body + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF)
 
 
-def validate() -> None:
-    strings = all_rendered_text()
-
-    # Exactly one date, rendered once, and no date-like text anywhere else.
-    assert strings.count(DATE_TEXT) == 1
-    forbidden = re.compile(r"\b(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)[A-Z]*\b|\b(?:19|20)\d{2}\b")
-    for text in strings:
-        if text == DATE_TEXT:
-            continue
-        assert not forbidden.search(text), f"date-like text: {text!r}"
-        assert all(char in FONT for char in text), f"missing glyph in: {text!r}"
-
-    # Every line fits its container; measured, never eyeballed.
-    for story in STORIES:
-        assert text_width(str(story["region"]), 3) <= CARD_W - 20
-        for line in story["head"]:
-            assert text_width(line, 3) <= TEXT_W, f"headline clipped: {line!r}"
-        for line in story["sub"]:
-            assert text_width(line, 2) <= TEXT_W, f"sub-line clipped: {line!r}"
-        chip = str(story["chip"])
-        assert text_width(chip, 2) + 14 <= TEXT_W, f"chip clipped: {chip!r}"
-    for line in TICKER:
-        assert text_width(line, 2) <= TICKER_W, f"ticker clipped: {line!r}"
-    assert text_width("WORLD NEWS", 10) <= W - 40
-    assert text_width(DATE_TEXT, 7) <= W - 40
-    assert text_width("WIRE", 3) <= 76
-
-    assert len(STORIES) == 8
-    assert CARD_W * 2 + GUTTER_X + GRID_X * 2 == W
-    assert GRID_Y + CARD_H * 4 + GUTTER_Y * 3 == TICKER_Y
-
-
-# ---------------------------------------------------------------------------
-# Hand-rolled PNG writer
-# ---------------------------------------------------------------------------
-
-
-def png_chunk(kind: bytes, data: bytes) -> bytes:
-    return (
-        struct.pack(">I", len(data))
-        + kind
-        + data
-        + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
-    )
-
-
-def encode_png(canvas: Canvas) -> bytes:
-    raw = bytearray()
-    stride = canvas.w * 3
-    for y in range(canvas.h):
-        raw.append(0)  # filter type 0 (None)
+def png_bytes(canvas):
+    stride = WIDTH * 3
+    raw = bytearray((HEIGHT * (stride + 1)))
+    for y in range(HEIGHT):
         start = y * stride
-        raw.extend(canvas.buf[start : start + stride])
-    ihdr = struct.pack(">IIBBBBB", canvas.w, canvas.h, 8, 2, 0, 0, 0)
-    return (
-        b"\x89PNG\r\n\x1a\n"
-        + png_chunk(b"IHDR", ihdr)
-        + png_chunk(b"IDAT", zlib.compress(bytes(raw), 9))
-        + png_chunk(b"IEND", b"")
-    )
+        dst = y * (stride + 1)
+        raw[dst] = 0
+        raw[dst + 1:dst + 1 + stride] = canvas[start:start + stride]
+    ihdr = struct.pack(">IIBBBBB", WIDTH, HEIGHT, 8, 2, 0, 0, 0)
+    return (b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", ihdr)
+            + chunk(b"IDAT", zlib.compress(bytes(raw), 9))
+            + chunk(b"IEND", b""))
 
 
-def main() -> None:
-    validate()
-    png = encode_png(render())
-    out_dir = Path(os.environ.get("OUT_DIR", "/output"))
-    out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / "main.png").write_bytes(png)
+def main():
+    image = png_bytes(render())
+    out_dir = os.environ.get("OUT_DIR", "/output")
+    os.makedirs(out_dir, exist_ok=True)
+    with open(os.path.join(out_dir, "entry.png"), "wb") as handle:
+        handle.write(image)
 
 
 if __name__ == "__main__":
